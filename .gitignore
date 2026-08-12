@@ -1,0 +1,15 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# Python 虚拟环境和本地配置
+.venv/
+venv/
+.env
+
+# 编辑器配置
+.idea/
+.vscode/
+
+# 仅供本地 AI 使用
+AGENTS.md
