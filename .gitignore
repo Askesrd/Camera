@@ -13,3 +13,7 @@ venv/
 
 # 仅供本地 AI 使用
 AGENTS.md
+
+# 本机上次使用的串口号
+settings.json
+t1.py

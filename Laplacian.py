@@ -40,7 +40,7 @@ class LaplacianThread(QThread):
     清晰度计算线程。
 
     Camera.py 把实时图像 frame 发到 add_frame()。
-    本线程计算 Laplacian 清晰度后，通过 focus_score_ready 发给 t2.py。
+    本线程计算 Laplacian 清晰度后，通过 focus_score_ready 发给 GUI 显示。
     """
 
     focus_score_ready = pyqtSignal(float)
@@ -57,7 +57,7 @@ class LaplacianThread(QThread):
         接收 Camera.py 发来的图像。
 
         如果清晰度计算来不及处理所有帧，就丢掉旧帧，只保留较新的图像，
-        避免自动对焦使用已经过时的位置图像。
+        避免界面显示已经过时的清晰度。
         """
         if not self.running:
             return
