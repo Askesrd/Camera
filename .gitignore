@@ -17,3 +17,6 @@ AGENTS.md
 # 本机上次使用的串口号
 settings.json
 t1.py
+
+# 本地测试，不上传
+tests/
