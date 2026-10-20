@@ -3,6 +3,7 @@
 
 import ctypes
 import queue
+import threading
 import time
 from pathlib import Path
 
@@ -24,7 +25,8 @@ class CameraThread(QThread):
     # ==============================
     frame_ready = pyqtSignal(object)  # 发送图像 frame
     text_ready = pyqtSignal(str)      # 发送状态文字
-    info_ready = pyqtSignal(str)      # 发送帧率、曝光等相机信息
+    info_ready = pyqtSignal(str)      # 发送分辨率和帧率信息
+    exposure_ready = pyqtSignal(int, bool, float, float, float)  # 请求编号、自动、时间/最小/最大（ms）
 
     def __init__(self, mode):
         super().__init__()
@@ -37,6 +39,14 @@ class CameraThread(QThread):
         # GUI 发来的文本命令会放到这个队列
         # ==============================
         self.commands = queue.Queue()
+        # 长按可能连续产生设置，只保存最新的一次，不积压旧曝光值。
+        self.exposure_lock = threading.Lock()
+        self.exposure_request = None
+        self.exposure_request_id = 0
+        self.exposure_applied_id = 0
+        self.exposure_min = 0
+        self.exposure_max = 0
+        self.exposure_last_time = 0.0
 
         self.running = True
 
@@ -85,6 +95,27 @@ class CameraThread(QThread):
         """
         self.commands.put(text)
 
+    def set_exposure(self, auto, milliseconds):
+        """GUI 只提交请求；相机 SDK 的读写仍由采集线程执行。"""
+        with self.exposure_lock:
+            self.exposure_request_id += 1
+            self.exposure_request = (self.exposure_request_id, auto, round(milliseconds * 1000))
+            return self.exposure_request_id
+
+    def show_exposure(self, force=False):
+        """即使尚无新帧，也每 0.2 秒更新自动曝光的当前时间。"""
+        now = time.monotonic()
+        if not force and now - self.exposure_last_time < 0.2:
+            return
+        self.exposure_last_time = now
+        auto = bool(self.cam.get_AutoExpoEnable())
+        try:
+            exposure_us = self.cam.get_RealExpoTime()
+        except toupcam.HRESULTException:
+            exposure_us = self.cam.get_ExpoTime()
+        self.exposure_ready.emit(self.exposure_applied_id, auto, exposure_us / 1000,
+                                 self.exposure_min / 1000, self.exposure_max / 1000)
+
     # ==================================================
     # 线程主函数
     # 调用 start() 后，Qt 会自动在后台线程里执行 run()
@@ -111,7 +142,11 @@ class CameraThread(QThread):
             except toupcam.HRESULTException:
                 pass
 
+            self.exposure_min, self.exposure_max, _ = self.cam.get_ExpTimeRange()
+            # 每次启动明确恢复连续自动曝光，不沿用上次手动状态。
+            self.cam.put_AutoExpoEnable(1)
             self.cam.StartPullModeWithCallback(None, None)
+            self.show_exposure(force=True)
 
             self.text_ready.emit(f"相机已启动")
 
@@ -119,6 +154,9 @@ class CameraThread(QThread):
             while self.running:
                 # 处理 GUI 发来的文本命令
                 self.handle_text_commands()
+                if not self.running:
+                    break
+                self.show_exposure()
 
                 # 拉取相机图像
                 try:
@@ -144,7 +182,7 @@ class CameraThread(QThread):
                 # 把当前帧交给命令处理函数，由它统一判断录像、单张保存、自动截图等任务。
                 self.handle_text_commands(frame)
 
-                # 每秒刷新一次 SDK 帧率和曝光时间，避免把状态提示文字刷掉。
+                # 每秒刷新一次帧率，曝光时间通过独立信号更新。
                 self.show_camera_info()
 
         except Exception as e:
@@ -159,7 +197,6 @@ class CameraThread(QThread):
 
         Python 帧率：本程序成功 PullImageV2 的速度。
         SDK 帧率：相机 SDK 自己统计的真实输出速度。
-        曝光时间：当前相机实际曝光时间，单位是微秒。
         """
         self.fps_count += 1
         now = time.perf_counter()
@@ -177,15 +214,10 @@ class CameraThread(QThread):
             sdk_fps = 0.0
             sdk_total_frames = 0
 
-        try:
-            real_exposure_us = self.cam.get_RealExpoTime()
-        except toupcam.HRESULTException:
-            real_exposure_us = 0
-
         self.info_ready.emit(
             f"相机信息：分辨率 {self.width} x {self.height} | "
             f"计算帧率 {python_fps:.2f} fps | "
-            f"SDK帧率 {sdk_fps:.2f} fps | 曝光 {real_exposure_us} us"
+            f"SDK帧率 {sdk_fps:.2f} fps"
         )
 
         self.fps_count = 0
@@ -218,6 +250,23 @@ class CameraThread(QThread):
 
             elif text == "auto":
                 self.handle_auto_capture()
+
+        with self.exposure_lock:
+            request = self.exposure_request
+            self.exposure_request = None
+        if request is not None and self.running:
+            request_id, auto, exposure_us = request
+            self.exposure_applied_id = request_id
+            try:
+                # 必须先关闭自动曝光，手动时间才不会马上被自动算法改写。
+                self.cam.put_AutoExpoEnable(1 if auto else 0)
+                if not auto:
+                    exposure_us = max(self.exposure_min, min(exposure_us, self.exposure_max))
+                    self.cam.put_ExpoTime(exposure_us)
+            except toupcam.HRESULTException as e:
+                self.text_ready.emit(f"曝光设置失败：{e}")
+            # 成功或失败都读回设备状态，避免界面显示未生效的设置。
+            self.show_exposure(force=True)
 
         if frame is None:
             return

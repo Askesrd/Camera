@@ -7,10 +7,10 @@ import time
 from pathlib import Path
 
 import cv2 as cv
-from PyQt5.QtCore import QEvent, Qt, QTimer
+from PyQt5.QtCore import QEvent, QSignalBlocker, Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QMainWindow,
     QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QVBoxLayout,
     QWidget,
@@ -43,6 +43,8 @@ class MainWindow(QMainWindow):
         self.motion_buttons = []
         self.axis_inputs = {}
         self.speed_inputs = {}
+        self.exposure_connected = False
+        self.exposure_request_id = 0
         self.jog_timer = QTimer(self)
         self.jog_timer.setInterval(80)
         self.jog_timer.timeout.connect(self.keep_jog)
@@ -79,6 +81,43 @@ class MainWindow(QMainWindow):
             label.setWordWrap(True)
             label.setTextFormat(Qt.PlainText)
             status_layout.addWidget(label)
+
+        # 左侧上下箭头、中间可逐位编辑的毫秒数、右侧自动曝光勾选框。
+        self.exposure_box = QDoubleSpinBox()
+        self.exposure_box.setObjectName("exposureBox")
+        self.exposure_box.setDecimals(3)  # 1 微秒 = 0.001 毫秒
+        self.exposure_box.setRange(0, 0)
+        self.exposure_box.setSpecialValueText("等待相机")
+        self.exposure_box.setSuffix(" ms")
+        self.exposure_box.setSingleStep(1.0)
+        self.exposure_box.setAccelerated(True)
+        self.exposure_box.setKeyboardTracking(False)  # 输入途中不提交，也不改变光标位置
+        self.exposure_box.setAlignment(Qt.AlignCenter)
+        self.exposure_box.setFixedWidth(230)
+        self.exposure_box.setMinimumHeight(38)
+        self.exposure_box.setEnabled(False)
+        self.exposure_box.setToolTip("单击调整 1 ms，长按加速；直接编辑后按回车或移开焦点应用")
+        self.exposure_box.setStyleSheet("""
+            QDoubleSpinBox#exposureBox { padding-left: 32px; padding-right: 5px; font-size: 16px; }
+            QDoubleSpinBox#exposureBox:disabled { color: #586270; background: #f2f4f7; }
+            QDoubleSpinBox#exposureBox::up-button {
+                subcontrol-origin: border; subcontrol-position: top left; width: 28px;
+            }
+            QDoubleSpinBox#exposureBox::down-button {
+                subcontrol-origin: border; subcontrol-position: bottom left; width: 28px;
+            }
+        """)
+        self.auto_exposure = QCheckBox("自动曝光")
+        self.auto_exposure.setChecked(True)
+        self.auto_exposure.setEnabled(False)
+        self.auto_exposure.toggled.connect(self.change_exposure)
+        self.exposure_box.valueChanged.connect(self.change_exposure)
+        exposure_layout = QHBoxLayout()
+        exposure_layout.addWidget(QLabel("曝光时间"))
+        exposure_layout.addWidget(self.exposure_box)
+        exposure_layout.addWidget(self.auto_exposure)
+        exposure_layout.addStretch()
+        status_layout.addLayout(exposure_layout)
 
         control_panel = QWidget()
         control_panel.setFixedWidth(280)
@@ -248,6 +287,8 @@ class MainWindow(QMainWindow):
         self.camera_thread.frame_ready.connect(self.laplacian_thread.add_frame)
         self.camera_thread.text_ready.connect(self.camera_status_label.setText)
         self.camera_thread.info_ready.connect(self.on_info)
+        self.camera_thread.exposure_ready.connect(self.on_exposure)
+        self.camera_thread.finished.connect(self.on_camera_stopped)
         self.laplacian_thread.focus_score_ready.connect(self.on_focus_score)
         self.laplacian_thread.text_ready.connect(self.camera_status_label.setText)
         self.control_thread.text_ready.connect(self.on_text)
@@ -270,6 +311,35 @@ class MainWindow(QMainWindow):
 
     def on_info(self, text):
         self.info_label.setText(text)
+
+    def on_exposure(self, request_id, auto, milliseconds, minimum, maximum):
+        # 丢弃较早请求的回读，避免快速切换时旧状态把新选择覆盖。
+        if self.closing or request_id < self.exposure_request_id:
+            return
+        first_read = not self.exposure_connected
+        self.exposure_connected = True
+        with QSignalBlocker(self.auto_exposure), QSignalBlocker(self.exposure_box):
+            self.auto_exposure.setChecked(auto)
+            if first_read:
+                self.exposure_box.setSpecialValueText("")
+                self.exposure_box.setRange(minimum, maximum)
+            # 手动编辑期间保留文字、选区和光标；回车/失焦时才提交。
+            if auto or first_read or not self.exposure_box.hasFocus():
+                self.exposure_box.setValue(milliseconds)
+        self.auto_exposure.setEnabled(True)
+        self.exposure_box.setEnabled(not auto)
+
+    def change_exposure(self):
+        if not self.exposure_connected or self.closing:
+            return
+        auto = self.auto_exposure.isChecked()
+        self.exposure_box.setEnabled(not auto)
+        self.exposure_request_id = self.camera_thread.set_exposure(auto, self.exposure_box.value())
+
+    def on_camera_stopped(self):
+        self.exposure_connected = False
+        self.auto_exposure.setEnabled(False)
+        self.exposure_box.setEnabled(False)
 
     def on_focus_score(self, score):
         self.focus_label.setText(f"{score:.2f}")
