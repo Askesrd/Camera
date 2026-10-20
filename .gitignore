@@ -1,24 +1,13 @@
-# Python 缓存
-__pycache__/
-*.py[cod]
+# 默认忽略所有文件和目录，仅保留当前远程 main 已有的文件。
+/*
 
-# Python 虚拟环境和本地配置
-.venv/
-venv/
-.env
-
-# 编辑器配置
-.idea/
-.vscode/
-
-# 仅供本地 AI 使用
-AGENTS.md
-
-# 本机上次使用的串口号
-settings.json
-t1.py
-
-# 仅上传 GUI 回归测试及离线配置，其余测试保留在本地
-tests/*
-!tests/conftest.py
-!tests/test_gui.py
+# 新增需要版本管理的文件时，在这里补充 !/文件路径。
+!/.gitignore
+!/Camera.py
+!/Control.py
+!/Laplacian.py
+!/main.py
+!/test.py
+!/testmain.py
+!/toupcam.dll
+!/toupcam.py
