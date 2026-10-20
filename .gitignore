@@ -18,5 +18,7 @@ AGENTS.md
 settings.json
 t1.py
 
-# 本地测试，不上传
-tests/
+# 仅上传 GUI 回归测试及离线配置，其余测试保留在本地
+tests/*
+!tests/conftest.py
+!tests/test_gui.py
