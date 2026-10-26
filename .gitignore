@@ -1,4 +1,4 @@
-# 默认忽略所有文件和目录，仅保留当前远程 main 已有的文件。
+# 默认忽略所有文件和目录，仅保留项目代码和明确允许的新模块。
 /*
 
 # 新增需要版本管理的文件时，在这里补充 !/文件路径。
@@ -6,6 +6,7 @@
 !/Camera.py
 !/Control.py
 !/Laplacian.py
+!/ScanStorage.py
 !/main.py
 !/test.py
 !/testmain.py

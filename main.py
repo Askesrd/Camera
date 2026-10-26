@@ -45,6 +45,10 @@ class MainWindow(QMainWindow):
         self.speed_inputs = {}
         self.exposure_connected = False
         self.exposure_request_id = 0
+        self.gain_connected = False
+        self.gain_request_id = 0
+        self.camera_locked = False
+        self.z_snapshot = {}
         self.jog_timer = QTimer(self)
         self.jog_timer.setInterval(80)
         self.jog_timer.timeout.connect(self.keep_jog)
@@ -118,6 +122,23 @@ class MainWindow(QMainWindow):
         exposure_layout.addWidget(self.auto_exposure)
         exposure_layout.addStretch()
         status_layout.addLayout(exposure_layout)
+
+        self.gain_box = QSpinBox()
+        self.gain_box.setSuffix(" %")
+        self.gain_box.setRange(0, 0)
+        self.gain_box.setSpecialValueText("等待相机")
+        self.gain_box.setKeyboardTracking(False)
+        self.gain_box.setEnabled(False)
+        self.gain_box.setToolTip("相机增益百分数，以设备范围和回读为准；关闭自动曝光后可设置")
+        self.gain_box.valueChanged.connect(self.change_gain)
+        self.camera_diagnostic = QLabel("相机诊断：等待设备；新帧时序未验证")
+        self.camera_diagnostic.setTextFormat(Qt.PlainText)
+        self.camera_diagnostic.setWordWrap(True)
+        gain_layout = QHBoxLayout()
+        gain_layout.addWidget(QLabel("增益"))
+        gain_layout.addWidget(self.gain_box)
+        gain_layout.addWidget(self.camera_diagnostic, stretch=1)
+        status_layout.addLayout(gain_layout)
 
         control_panel = QWidget()
         control_panel.setFixedWidth(280)
@@ -222,6 +243,38 @@ class MainWindow(QMainWindow):
             z_grid.addWidget(step_button, 1, column)
             z_grid.addWidget(hold_button, 2, column)
             self.motion_buttons.extend(((step_button, "Z"), (hold_button, "Z")))
+
+        self.z_reference_buttons = []
+        for column, (text, reset) in enumerate((("确认软件参考", False), ("当前位置设零", True))):
+            button = QPushButton(text)
+            button.setToolTip("仅建立新软件参考并清除 A/B，不发送运动，也不是机械回零")
+            button.clicked.connect(lambda checked=False, zero=reset:
+                                   self.control_thread.send_command("reference", "Z", zero))
+            z_grid.addWidget(button, 3, column)
+            self.z_reference_buttons.append(button)
+        self.z_reference_label = QLabel("软件参考：等待 Z 连接\nA：未记录  ·  B：未记录")
+        self.z_reference_label.setWordWrap(True)
+        z_grid.addWidget(self.z_reference_label, 4, 0, 1, 2)
+        self.z_mark_buttons, self.z_return_buttons = {}, {}
+        for column, mark in enumerate(("A", "B")):
+            button = QPushButton("记录 " + mark)
+            button.clicked.connect(lambda checked=False, m=mark:
+                                   self.control_thread.send_command("mark", "Z", m))
+            z_grid.addWidget(button, 5, column)
+            self.z_mark_buttons[mark] = button
+            button = QPushButton("返回 " + mark)
+            button.setToolTip("明确点击后，移动到当前软件参考的指令位置；不补偿反向间隙")
+            button.clicked.connect(lambda checked=False, m=mark: self.return_z_mark(m))
+            z_grid.addWidget(button, 6, column)
+            self.z_return_buttons[mark] = button
+        self.btn_z_invalidate = QPushButton("手动移轴 / 失步后使参考失效")
+        self.btn_z_invalidate.clicked.connect(lambda:
+            self.control_thread.send_command("invalidate", "Z", "操作者报告位置或脉冲配置改变"))
+        z_grid.addWidget(self.btn_z_invalidate, 7, 0, 1, 2)
+        reference_note = QLabel("自动定位限已记录的 A/B 范围。\n3200 脉冲/转；累计不是实测位置。")
+        reference_note.setWordWrap(True)
+        reference_note.setStyleSheet("color: #60666e; font-size: 11px;")
+        z_grid.addWidget(reference_note, 8, 0, 1, 2)
         controls.addWidget(z_group)
 
         self.btn_position = QPushButton("刷新 XY 位置")
@@ -236,8 +289,8 @@ class MainWindow(QMainWindow):
         controls.addWidget(focus_group)
         self.btn_stop = QPushButton("停止当前运动  /  Esc")
         self.btn_stop.setStyleSheet("background: #fbe5e5; color: #9d2525; font-weight: bold;")
+        self.btn_stop.setMinimumHeight(32)
         self.btn_stop.clicked.connect(self.stop_movement)
-        controls.addWidget(self.btn_stop)
 
         hint = QLabel(
             f"长按上限：{JOG_MAX_SECONDS:g} 秒；XY 每轴 {JOG_MAX_XY_MM:g} mm / "
@@ -272,22 +325,32 @@ class MainWindow(QMainWindow):
         control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         control_scroll.setFixedWidth(304)
         control_scroll.setWidget(control_panel)
+        left_layout = QVBoxLayout()
+        left_layout.setSpacing(6)
+        left_layout.addWidget(control_scroll, stretch=1)
+        left_layout.addWidget(self.btn_stop)  # 固定在滚动区外，任何位置都能停止
 
         right_layout = QVBoxLayout()
         right_layout.addWidget(status_group)
         right_layout.addWidget(self.video_label, stretch=1)
         layout = QHBoxLayout()
-        layout.addWidget(control_scroll)
+        layout.addLayout(left_layout)
         layout.addLayout(right_layout, stretch=1)
         central = QWidget()
         central.setLayout(layout)
         self.setCentralWidget(central)
 
-        self.camera_thread.frame_ready.connect(self.on_frame)
-        self.camera_thread.frame_ready.connect(self.laplacian_thread.add_frame)
+        # GUI 定时取最新图，不让全分辨率图像在 Qt 事件队列中排成长队。
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setInterval(33)
+        self.preview_timer.timeout.connect(self.refresh_preview)
+        self.preview_timer.start()
         self.camera_thread.text_ready.connect(self.camera_status_label.setText)
         self.camera_thread.info_ready.connect(self.on_info)
         self.camera_thread.exposure_ready.connect(self.on_exposure)
+        self.camera_thread.gain_ready.connect(self.on_gain)
+        self.camera_thread.diagnostic_ready.connect(self.on_diagnostic)
+        self.camera_thread.capture_lock_changed.connect(self.on_capture_lock)
         self.camera_thread.finished.connect(self.on_camera_stopped)
         self.laplacian_thread.focus_score_ready.connect(self.on_focus_score)
         self.laplacian_thread.text_ready.connect(self.camera_status_label.setText)
@@ -296,6 +359,8 @@ class MainWindow(QMainWindow):
         self.control_thread.busy_changed.connect(self.update_controls)
         self.control_thread.connection_ready.connect(self.on_connections)
         self.control_thread.speed_ready.connect(self.on_speed)
+        self.control_thread.position_ready.connect(self.on_z_position)
+        self.control_thread.result_ready.connect(self.on_motion_result)
 
         QApplication.instance().installEventFilter(self)
         self.update_controls(True)
@@ -326,20 +391,79 @@ class MainWindow(QMainWindow):
             # 手动编辑期间保留文字、选区和光标；回车/失焦时才提交。
             if auto or first_read or not self.exposure_box.hasFocus():
                 self.exposure_box.setValue(milliseconds)
-        self.auto_exposure.setEnabled(True)
-        self.exposure_box.setEnabled(not auto)
+        self.auto_exposure.setEnabled(not self.camera_locked)
+        self.exposure_box.setEnabled(not auto and not self.camera_locked)
+        self.gain_box.setEnabled(self.gain_connected and not auto and not self.camera_locked)
 
     def change_exposure(self):
-        if not self.exposure_connected or self.closing:
+        if not self.exposure_connected or self.closing or self.camera_locked:
             return
         auto = self.auto_exposure.isChecked()
         self.exposure_box.setEnabled(not auto)
+        self.gain_box.setEnabled(self.gain_connected and not auto and not self.camera_locked)
         self.exposure_request_id = self.camera_thread.set_exposure(auto, self.exposure_box.value())
+
+    def on_gain(self, request_id, percent, minimum, maximum):
+        if self.closing or request_id < self.gain_request_id:
+            return
+        self.gain_connected = True
+        with QSignalBlocker(self.gain_box):
+            self.gain_box.setSpecialValueText("")
+            self.gain_box.setRange(minimum, maximum)
+            if not self.gain_box.hasFocus():
+                self.gain_box.setValue(percent)
+        self.gain_box.setEnabled(not self.auto_exposure.isChecked() and not self.camera_locked)
+
+    def change_gain(self):
+        if self.gain_connected and not self.closing and not self.camera_locked:
+            self.gain_request_id = self.camera_thread.set_gain(self.gain_box.value())
+
+    def on_diagnostic(self, diagnostic):
+        trigger = "支持软件触发能力位" if diagnostic.get("software_trigger_supported") else "未报告软件触发能力"
+        api = diagnostic.get("frame_info_api") or "等待帧信息"
+        self.camera_diagnostic.setText(f"{diagnostic.get('camera_model', '未知型号')} · {api} · 新帧时序未验证")
+        self.camera_diagnostic.setToolTip(
+            f"设备 ID：{diagnostic.get('camera_id')}\nSDK：{diagnostic.get('sdk_version')}\n{trigger}\n"
+            f"帧序号有效：{diagnostic.get('seq_valid')}；设备时间戳有效：{diagnostic.get('timestamp_valid')}\n"
+            "能力位或触发调用成功不代表已完成曝光时序验证。"
+        )
+
+    def on_capture_lock(self, locked):
+        self.camera_locked = locked
+        self.auto_exposure.setEnabled(self.exposure_connected and not locked and not self.closing)
+        self.exposure_box.setEnabled(self.exposure_connected and not self.auto_exposure.isChecked()
+                                     and not locked and not self.closing)
+        self.gain_box.setEnabled(self.gain_connected and not self.auto_exposure.isChecked()
+                                 and not locked and not self.closing)
+        for button in (self.btn_save, self.btn_record_start, self.btn_record_stop, self.btn_auto):
+            button.setEnabled(not locked and not self.closing)
 
     def on_camera_stopped(self):
         self.exposure_connected = False
         self.auto_exposure.setEnabled(False)
         self.exposure_box.setEnabled(False)
+        self.gain_connected = False
+        self.gain_box.setEnabled(False)
+
+    def on_z_position(self, position):
+        if position.get("state_monotonic_ns", 0) < self.z_snapshot.get("state_monotonic_ns", 0):
+            return
+        self.z_snapshot = position
+        known = position["z_position_valid"]
+        reference = "已确认" if position["z_reference_confirmed"] else "未确认"
+        steps = f"{position['z_command_steps']:+d} 步" if known else "未知，需检查并重新连接"
+        marks = position["marks"]
+        self.z_reference_label.setText(f"指令累计：{steps}；参考{reference}\n"
+                                      f"A：{marks.get('A', '未记录')}  ·  B：{marks.get('B', '未记录')}")
+        self.update_controls(position["motion_busy"])
+
+    def on_motion_result(self, result):
+        self.on_z_position(result["position"])
+
+    def return_z_mark(self, mark):
+        if mark in self.z_snapshot.get("marks", {}):
+            self.control_thread.request_z_move(self.z_snapshot["marks"][mark],
+                                               request_id=None, owner="manual")
 
     def on_focus_score(self, score):
         self.focus_label.setText(f"{score:.2f}")
@@ -354,16 +478,26 @@ class MainWindow(QMainWindow):
 
     def update_controls(self, busy):
         self.control_busy = busy
+        manual = self.z_snapshot.get("control_owner", "manual") == "manual"
         if not busy:
             self.end_jog()
         for button, axis in self.motion_buttons:
             ready = self.z_ready if axis == "Z" else self.xy_ready
             # 正在按住的按钮必须保留，以便接收 released。
-            button.setEnabled(ready and (not busy or button is self.jog_button))
+            button.setEnabled(ready and manual and (not busy or button is self.jog_button))
         for amount in self.axis_inputs.values():
-            amount.setEnabled(not busy)
+            amount.setEnabled(not busy and manual)
         for speed in self.speed_inputs.values():
-            speed.setEnabled(self.xy_ready and not busy)
+            speed.setEnabled(self.xy_ready and not busy and manual)
+        z_idle = self.z_ready and not busy and manual
+        valid = self.z_snapshot.get("z_position_valid", False)
+        for button in self.z_reference_buttons:
+            button.setEnabled(z_idle and valid)
+        for button in self.z_mark_buttons.values():
+            button.setEnabled(z_idle and valid and self.z_snapshot.get("z_reference_confirmed", False))
+        for button in self.z_return_buttons.values():
+            button.setEnabled(z_idle and valid and self.z_snapshot.get("allowed_z_range") is not None)
+        self.btn_z_invalidate.setEnabled(z_idle and valid)
 
     def start_jog(self, axis, direction, button):
         # 鼠标移出再移入也可能触发 pressed；必须真正重新按下才能再次运动。
@@ -394,6 +528,7 @@ class MainWindow(QMainWindow):
     def stop_movement(self):
         self.end_jog()
         self.control_thread.stop_motion()
+        self.camera_thread.cancel_capture()
         self.on_text("已请求停止；Z 将走完当前短段后停止")
 
     def eventFilter(self, watched, event):
@@ -421,9 +556,16 @@ class MainWindow(QMainWindow):
             self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
         ))
 
+    def refresh_preview(self):
+        frame = self.camera_thread.take_preview_frame()
+        if frame is not None and not self.closing:
+            self.on_frame(frame)
+            self.laplacian_thread.add_frame(frame)
+
     def closeEvent(self, event):
         if not self.closing:
             self.closing = True
+            self.preview_timer.stop()
             self.stop_movement()
             self.send_text("stop")
             self.laplacian_thread.stop_thread()
