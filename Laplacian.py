@@ -1,6 +1,7 @@
 import queue
 
 import cv2 as cv
+import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
 
 
@@ -33,6 +34,28 @@ def calculate_focus_score(frame, roi=None):
 # 保留旧函数名，后面如果还有地方调用 laplacian(img)，也不会立刻失效。
 def laplacian(img):
     return calculate_focus_score(img)
+
+
+def tenengrad(frame, roi=None):
+    """扫描用原始 8 位图评分；不改变原图，不与实时 Laplacian 混用。"""
+    if (not isinstance(frame, np.ndarray) or frame.dtype != np.uint8
+            or frame.ndim not in (2, 3) or not frame.size
+            or (frame.ndim == 3 and frame.shape[2] != 3)):
+        raise ValueError("Tenengrad 需要非空 uint8 灰度或 BGR 图像")
+    if roi is not None:
+        if (len(roi) != 4 or any(type(v) is not int for v in roi)):
+            raise ValueError("ROI 必须是整数 x、y、宽、高")
+        x, y, width, height = roi
+        if x < 0 or y < 0 or width < 8 or height < 8 or x + width > frame.shape[1] or y + height > frame.shape[0]:
+            raise ValueError("ROI 越界或小于 8×8 像素")
+        frame = frame[y:y + height, x:x + width]
+    gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    gx = cv.Sobel(gray, cv.CV_32F, 1, 0, ksize=3, scale=1, borderType=cv.BORDER_REFLECT_101)
+    gy = cv.Sobel(gray, cv.CV_32F, 0, 1, ksize=3, scale=1, borderType=cv.BORDER_REFLECT_101)
+    score = float(np.mean(gx * gx + gy * gy))
+    if not np.isfinite(score):
+        raise ValueError("清晰度分数不是有限数值")
+    return score
 
 
 class LaplacianThread(QThread):

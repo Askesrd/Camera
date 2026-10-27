@@ -7,6 +7,8 @@
 !/Control.py
 !/Laplacian.py
 !/ScanStorage.py
+!/Scan.py
+!/ScanView.py
 !/main.py
 !/test.py
 !/testmain.py

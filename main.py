@@ -4,25 +4,27 @@
 import json
 import sys
 import time
+import copy
 from pathlib import Path
 
 import cv2 as cv
-from PyQt5.QtCore import QEvent, QSignalBlocker, Qt, QTimer
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import QEvent, QRect, QSignalBlocker, Qt, QTimer
+from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QMainWindow,
+    QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QVBoxLayout,
-    QWidget,
+    QRubberBand, QSplitter, QWidget,
 )
 from serial.tools import list_ports
 
-from Camera import CameraThread
+from Camera import CameraThread, SAVE_DIR
 from Laplacian import LaplacianThread
 from Control import (
     ControlThread, MAX_XY_MOVE_MM, MAX_Z_MOVE_STEPS,
-    JOG_MAX_SECONDS, JOG_MAX_XY_MM, JOG_MAX_Z_STEPS,
 )
+from Scan import ScanThread, make_scan_plan
+from ScanView import ScanPanel, roi_from_drag
 
 
 SETTINGS_PATH = Path(__file__).with_name("settings.json")
@@ -34,6 +36,14 @@ class MainWindow(QMainWindow):
         self.camera_thread = CameraThread(mode)
         self.laplacian_thread = LaplacianThread()
         self.control_thread = ControlThread(xy_port, z_port)
+        self.scan_thread = ScanThread(self.control_thread, self.camera_thread)
+        self.scan_active = False
+        self.workers_stopping = False
+        self.camera_diagnostic_data = {}
+        self.current_frame = None
+        self.roi = None
+        self.roi_start = None
+        self.last_marks = None
         self.xy_ready = False
         self.z_ready = False
         self.control_busy = True
@@ -66,9 +76,11 @@ class MainWindow(QMainWindow):
         self.video_label = QLabel("等待相机图像")
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setStyleSheet("background: #15191e; color: #d8dee7;")
-        self.video_label.setMinimumSize(400, 280)
+        self.video_label.setMinimumSize(400, 140)
         # 忽略上一张图片的尺寸建议，缩放窗口时图像区域才不会越撑越大。
         self.video_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.video_label.setMouseTracking(True)
+        self.roi_band = QRubberBand(QRubberBand.Rectangle, self.video_label)
 
         self.status_label = QLabel("控制：正在初始化")
         self.camera_status_label = QLabel("相机：启动中")
@@ -252,8 +264,10 @@ class MainWindow(QMainWindow):
                                    self.control_thread.send_command("reference", "Z", zero))
             z_grid.addWidget(button, 3, column)
             self.z_reference_buttons.append(button)
-        self.z_reference_label = QLabel("软件参考：等待 Z 连接\nA：未记录  ·  B：未记录")
-        self.z_reference_label.setWordWrap(True)
+        self.z_reference_label = QLabel("指令累计：等待连接\n软件参考：未确认\nA：未记录\nB：未记录")
+        self.z_reference_label.setWordWrap(False)
+        self.z_reference_label.setFixedHeight(self.z_reference_label.fontMetrics().lineSpacing() * 4 + 6)
+        self.z_reference_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         z_grid.addWidget(self.z_reference_label, 4, 0, 1, 2)
         self.z_mark_buttons, self.z_return_buttons = {}, {}
         for column, mark in enumerate(("A", "B")):
@@ -271,11 +285,67 @@ class MainWindow(QMainWindow):
         self.btn_z_invalidate.clicked.connect(lambda:
             self.control_thread.send_command("invalidate", "Z", "操作者报告位置或脉冲配置改变"))
         z_grid.addWidget(self.btn_z_invalidate, 7, 0, 1, 2)
-        reference_note = QLabel("自动定位限已记录的 A/B 范围。\n3200 脉冲/转；累计不是实测位置。")
-        reference_note.setWordWrap(True)
-        reference_note.setStyleSheet("color: #60666e; font-size: 11px;")
-        z_grid.addWidget(reference_note, 8, 0, 1, 2)
         controls.addWidget(z_group)
+
+        scan_group = QGroupBox("Z 定点扫描")
+        scan_grid = QGridLayout(scan_group)
+        self.scan_a, self.scan_b = QSpinBox(), QSpinBox()
+        for box, prefix in ((self.scan_a, "A  "), (self.scan_b, "B  ")):
+            box.setRange(-2147483647, 2147483647)
+            box.setPrefix(prefix)
+            box.setKeyboardTracking(False)
+            box.valueChanged.connect(self.update_scan_plan)
+        scan_grid.addWidget(self.scan_a, 0, 0)
+        scan_grid.addWidget(self.scan_b, 0, 1)
+        self.scan_interval = QSpinBox()
+        self.scan_interval.setRange(1, MAX_Z_MOVE_STEPS)
+        self.scan_interval.setValue(8)
+        self.scan_interval.setSuffix(" 脉冲")
+        self.scan_interval.valueChanged.connect(self.update_scan_plan)
+        self.scan_settle = QSpinBox()
+        self.scan_settle.setRange(0, 60000)
+        self.scan_settle.setValue(200)
+        self.scan_settle.setSuffix(" ms")
+        self.scan_settle.setToolTip("初始试验等待值，需要实机比较；不代表已测得停稳")
+        scan_grid.addWidget(QLabel("采样间隔"), 1, 0)
+        scan_grid.addWidget(self.scan_interval, 1, 1)
+        scan_grid.addWidget(QLabel("停稳等待"), 2, 0)
+        scan_grid.addWidget(self.scan_settle, 2, 1)
+        self.sample_name = QLineEdit()
+        self.sample_name.setPlaceholderText("样品 / 视野名称")
+        scan_grid.addWidget(self.sample_name, 3, 0, 1, 2)
+        self.scan_output = QLineEdit(str(SAVE_DIR))
+        self.scan_output.setToolTip("扫描数据目录；每条曲线使用唯一 Run，不覆盖旧数据")
+        self.btn_scan_output = QPushButton("目录…")
+        self.btn_scan_output.clicked.connect(self.choose_scan_output)
+        scan_grid.addWidget(self.scan_output, 4, 0)
+        scan_grid.addWidget(self.btn_scan_output, 4, 1)
+        self.btn_roi = QPushButton("框选 ROI")
+        self.btn_roi.setCheckable(True)
+        self.btn_roi.toggled.connect(self.on_roi_mode)
+        self.btn_full_roi = QPushButton("使用全图")
+        self.btn_full_roi.clicked.connect(self.use_full_roi)
+        scan_grid.addWidget(self.btn_roi, 5, 0)
+        scan_grid.addWidget(self.btn_full_roi, 5, 1)
+        self.roi_label = QLabel("ROI：全图")
+        self.roi_label.setWordWrap(True)
+        scan_grid.addWidget(self.roi_label, 6, 0, 1, 2)
+        self.scan_plan_label = QLabel("等待相机和 A/B")
+        self.scan_plan_label.setWordWrap(True)
+        self.scan_plan_label.setTextFormat(Qt.PlainText)
+        self.scan_plan_label.setFixedHeight(self.scan_plan_label.fontMetrics().lineSpacing() * 4 + 6)
+        scan_grid.addWidget(self.scan_plan_label, 7, 0, 1, 2)
+        self.btn_scan = QPushButton("开始 Z 扫描")
+        self.btn_scan.clicked.connect(self.start_scan)
+        scan_grid.addWidget(self.btn_scan, 8, 0, 1, 2)
+        self.scan_status = QLabel("扫描：空闲")
+        self.scan_status.setWordWrap(True)
+        self.scan_status.setTextFormat(Qt.PlainText)
+        scan_grid.addWidget(self.scan_status, 9, 0, 1, 2)
+        self.scan_inputs = [self.scan_a, self.scan_b, self.scan_interval, self.scan_settle,
+            self.sample_name, self.scan_output, self.btn_scan_output, self.btn_roi,
+            self.btn_full_roi]
+        controls.addWidget(scan_group)
 
         self.btn_position = QPushButton("刷新 XY 位置")
         self.btn_position.clicked.connect(lambda: self.control_thread.send_command("position"))
@@ -292,14 +362,6 @@ class MainWindow(QMainWindow):
         self.btn_stop.setMinimumHeight(32)
         self.btn_stop.clicked.connect(self.stop_movement)
 
-        hint = QLabel(
-            f"长按上限：{JOG_MAX_SECONDS:g} 秒；XY 每轴 {JOG_MAX_XY_MM:g} mm / "
-            f"Z {JOG_MAX_Z_STEPS} 步，先到即停。\n"
-            "Z 松开后走完当前短段，约 50 ms 加通信延迟；不是硬件急停。"
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #60666e; font-size: 11px;")
-        controls.addWidget(hint)
 
         capture_group = QGroupBox("图像采集")
         capture_grid = QGridLayout(capture_group)
@@ -332,7 +394,14 @@ class MainWindow(QMainWindow):
 
         right_layout = QVBoxLayout()
         right_layout.addWidget(status_group)
-        right_layout.addWidget(self.video_label, stretch=1)
+        self.scan_panel = ScanPanel()
+        self.scan_panel.hide()
+        self.image_splitter = QSplitter(Qt.Vertical)
+        self.image_splitter.addWidget(self.video_label)
+        self.image_splitter.addWidget(self.scan_panel)
+        self.image_splitter.setStretchFactor(0, 2)
+        self.image_splitter.setStretchFactor(1, 1)
+        right_layout.addWidget(self.image_splitter, stretch=1)
         layout = QHBoxLayout()
         layout.addLayout(left_layout)
         layout.addLayout(right_layout, stretch=1)
@@ -361,6 +430,11 @@ class MainWindow(QMainWindow):
         self.control_thread.speed_ready.connect(self.on_speed)
         self.control_thread.position_ready.connect(self.on_z_position)
         self.control_thread.result_ready.connect(self.on_motion_result)
+        self.scan_thread.state_changed.connect(self.on_scan_state)
+        self.scan_thread.prepared.connect(self.on_scan_prepared)
+        self.scan_thread.sample_ready.connect(self.scan_panel.add_sample)
+        self.scan_thread.task_result.connect(self.on_scan_result)
+        self.scan_thread.finished.connect(self.on_scan_stopped)
 
         QApplication.instance().installEventFilter(self)
         self.update_controls(True)
@@ -391,12 +465,13 @@ class MainWindow(QMainWindow):
             # 手动编辑期间保留文字、选区和光标；回车/失焦时才提交。
             if auto or first_read or not self.exposure_box.hasFocus():
                 self.exposure_box.setValue(milliseconds)
-        self.auto_exposure.setEnabled(not self.camera_locked)
-        self.exposure_box.setEnabled(not auto and not self.camera_locked)
-        self.gain_box.setEnabled(self.gain_connected and not auto and not self.camera_locked)
+        unlocked = not self.camera_locked and not self.scan_active
+        self.auto_exposure.setEnabled(unlocked)
+        self.exposure_box.setEnabled(not auto and unlocked)
+        self.gain_box.setEnabled(self.gain_connected and not auto and unlocked)
 
     def change_exposure(self):
-        if not self.exposure_connected or self.closing or self.camera_locked:
+        if not self.exposure_connected or self.closing or self.camera_locked or self.scan_active:
             return
         auto = self.auto_exposure.isChecked()
         self.exposure_box.setEnabled(not auto)
@@ -412,24 +487,29 @@ class MainWindow(QMainWindow):
             self.gain_box.setRange(minimum, maximum)
             if not self.gain_box.hasFocus():
                 self.gain_box.setValue(percent)
-        self.gain_box.setEnabled(not self.auto_exposure.isChecked() and not self.camera_locked)
+        self.gain_box.setEnabled(not self.auto_exposure.isChecked() and not self.camera_locked and not self.scan_active)
 
     def change_gain(self):
-        if self.gain_connected and not self.closing and not self.camera_locked:
+        if self.gain_connected and not self.closing and not self.camera_locked and not self.scan_active:
             self.gain_request_id = self.camera_thread.set_gain(self.gain_box.value())
 
     def on_diagnostic(self, diagnostic):
+        self.camera_diagnostic_data = copy.deepcopy(diagnostic)
         trigger = "支持软件触发能力位" if diagnostic.get("software_trigger_supported") else "未报告软件触发能力"
         api = diagnostic.get("frame_info_api") or "等待帧信息"
-        self.camera_diagnostic.setText(f"{diagnostic.get('camera_model', '未知型号')} · {api} · 新帧时序未验证")
+        freshness = "自动连续采集 · 时序未实测" if diagnostic.get("freshness_method") == "continuous_unverified" else "连续预览 · 时序未验证"
+        self.camera_diagnostic.setText(f"{diagnostic.get('camera_model', '未知型号')} · {api} · {freshness}")
         self.camera_diagnostic.setToolTip(
             f"设备 ID：{diagnostic.get('camera_id')}\nSDK：{diagnostic.get('sdk_version')}\n{trigger}\n"
             f"帧序号有效：{diagnostic.get('seq_valid')}；设备时间戳有效：{diagnostic.get('timestamp_valid')}\n"
-            "能力位或触发调用成功不代表已完成曝光时序验证。"
+            f"本次连接环境：{diagnostic.get('camera_environment_id')}\n"
+            "扫描自动清缓存并按曝光估算等待；估算等待不是实测的新帧时序保证。"
         )
+        self.update_scan_plan()
 
     def on_capture_lock(self, locked):
         self.camera_locked = locked
+        locked = locked or self.scan_active
         self.auto_exposure.setEnabled(self.exposure_connected and not locked and not self.closing)
         self.exposure_box.setEnabled(self.exposure_connected and not self.auto_exposure.isChecked()
                                      and not locked and not self.closing)
@@ -444,6 +524,9 @@ class MainWindow(QMainWindow):
         self.exposure_box.setEnabled(False)
         self.gain_connected = False
         self.gain_box.setEnabled(False)
+        if self.scan_active:
+            self.scan_thread.cancel_task()
+        self.update_scan_plan()
 
     def on_z_position(self, position):
         if position.get("state_monotonic_ns", 0) < self.z_snapshot.get("state_monotonic_ns", 0):
@@ -451,10 +534,15 @@ class MainWindow(QMainWindow):
         self.z_snapshot = position
         known = position["z_position_valid"]
         reference = "已确认" if position["z_reference_confirmed"] else "未确认"
-        steps = f"{position['z_command_steps']:+d} 步" if known else "未知，需检查并重新连接"
+        steps = f"{position['z_command_steps']:+d} 步" if known else "未知"
         marks = position["marks"]
-        self.z_reference_label.setText(f"指令累计：{steps}；参考{reference}\n"
-                                      f"A：{marks.get('A', '未记录')}  ·  B：{marks.get('B', '未记录')}")
+        if marks != self.last_marks:
+            self.last_marks = dict(marks)
+            self.scan_a.setValue(marks.get("A", 0))
+            self.scan_b.setValue(marks.get("B", 0))
+        self.z_reference_label.setText(f"指令累计：{steps}\n软件参考：{reference}\n"
+                                      f"A：{marks.get('A', '未记录')}\nB：{marks.get('B', '未记录')}")
+        self.z_reference_label.setToolTip(self.z_reference_label.text())
         self.update_controls(position["motion_busy"])
 
     def on_motion_result(self, result):
@@ -478,7 +566,7 @@ class MainWindow(QMainWindow):
 
     def update_controls(self, busy):
         self.control_busy = busy
-        manual = self.z_snapshot.get("control_owner", "manual") == "manual"
+        manual = self.z_snapshot.get("control_owner", "manual") == "manual" and not self.scan_active
         if not busy:
             self.end_jog()
         for button, axis in self.motion_buttons:
@@ -498,6 +586,103 @@ class MainWindow(QMainWindow):
         for button in self.z_return_buttons.values():
             button.setEnabled(z_idle and valid and self.z_snapshot.get("allowed_z_range") is not None)
         self.btn_z_invalidate.setEnabled(z_idle and valid)
+        self.update_scan_plan()
+
+    def update_scan_plan(self):
+        width = self.camera_diagnostic_data.get("width", 0)
+        height = self.camera_diagnostic_data.get("height", 0)
+        try:
+            plan = make_scan_plan(self.scan_a.value(), self.scan_b.value(), self.scan_interval.value(), width, height, self.roi)
+            self.scan_plan_label.setText(f"{plan['target_count']} 点 · {'A→B 正向' if plan['scan_direction'] > 0 else 'A→B 反向'}\n"
+                f"原图未压缩约 {plan['raw_image_bytes'] / 1048576:.1f} MiB\n"
+                f"磁盘保守预算 {plan['disk_estimate_bytes'] / 1048576:.1f} MiB\n"
+                f"处理内存预算约 {plan['memory_estimate_bytes'] / 1048576:.1f} MiB")
+            plan_ok = True
+        except ValueError as error:
+            self.scan_plan_label.setText(str(error) if width and height else "等待相机尺寸及有效的 A/B")
+            plan_ok = False
+        idle = not self.scan_active and not self.closing
+        for widget in self.scan_inputs:
+            widget.setEnabled(idle)
+        self.btn_roi.setEnabled(idle and self.current_frame is not None)
+        ready = (self.z_ready and self.exposure_connected and self.gain_connected
+                 and self.z_snapshot.get("z_reference_confirmed", False)
+                 and self.z_snapshot.get("z_position_valid", False)
+                 and self.z_snapshot.get("allowed_z_range") is not None
+                 and self.z_snapshot.get("control_owner", "manual") == "manual"
+                 and not self.control_busy and not self.camera_locked)
+        self.btn_scan.setEnabled(idle and ready and plan_ok)
+
+    def choose_scan_output(self):
+        path = QFileDialog.getExistingDirectory(self, "选择扫描输出目录", self.scan_output.text())
+        if path:
+            self.scan_output.setText(path)
+
+    def on_roi_mode(self, checked):
+        if not checked:
+            self.roi_start = None
+            self.roi_band.hide()
+
+    def use_full_roi(self):
+        if self.scan_active:
+            return
+        self.roi = None
+        self.btn_roi.setChecked(False)
+        self.roi_label.setText("ROI：全图")
+        if self.current_frame is not None:
+            self.on_frame(self.current_frame)
+        self.update_scan_plan()
+
+    def start_scan(self):
+        if self.scan_active or self.closing:
+            return
+        if not self.scan_output.text().strip():
+            self.scan_status.setText("请先选择输出目录")
+            return
+        exposure_us = round(self.exposure_box.value() * 1000)
+        config = {"a_steps": self.scan_a.value(), "b_steps": self.scan_b.value(),
+            "interval_steps": self.scan_interval.value(), "settle_ms": self.scan_settle.value(),
+            "sample_name": self.sample_name.text().strip(), "output_dir": self.scan_output.text().strip(),
+            "position": copy.deepcopy(self.z_snapshot), "roi": copy.deepcopy(self.roi),
+            "width": self.camera_diagnostic_data.get("width", 0), "height": self.camera_diagnostic_data.get("height", 0),
+            "mode": self.camera_thread.mode, "exposure_us": exposure_us,
+            "gain_percent": self.gain_box.value()}
+        try:
+            make_scan_plan(config["a_steps"], config["b_steps"], config["interval_steps"], config["width"], config["height"], config["roi"])
+        except ValueError as error:
+            self.scan_status.setText(f"扫描计划无效：{error}")
+            return
+        if not self.scan_thread.configure(config):
+            self.scan_status.setText("上一次扫描尚未收尾")
+            return
+        self.btn_roi.setChecked(False)
+        self.scan_active = True
+        self.on_capture_lock(self.camera_locked)
+        self.update_controls(self.control_busy)
+        self.scan_status.setText("扫描：正在预检，尚未移动")
+        self.scan_thread.start()
+
+    def on_scan_state(self, state):
+        names = {"PREPARING": "预检", "MOVING": "移动", "SETTLING": "停稳等待",
+                 "CAPTURING": "采集三帧", "PROCESSING": "评分选图", "SAVING": "保存本点",
+                 "COMPLETED": "完成", "CANCELLED": "已取消", "FAILED": "失败"}
+        self.scan_status.setText("扫描：" + names.get(state, state))
+
+    def on_scan_prepared(self, payload):
+        self.scan_panel.begin_run(payload)
+        self.scan_panel.show()
+        self.image_splitter.setSizes([420, 270])
+
+    def on_scan_result(self, result):
+        name = {"completed": "完成", "cancelled": "已取消", "failed": "失败"}[result["status"]]
+        self.scan_status.setText(f"扫描{name}，已保存 {result['committed_count']} 点\n"
+            + (result.get("cleanup_error") or result.get("error") or "结束后停留在终点，未自动回位"))
+        self.scan_status.setToolTip(result.get("run_dir") or "未创建 Run")
+
+    def on_scan_stopped(self):
+        self.scan_active = False
+        self.on_z_position(self.control_thread.position_snapshot())
+        self.on_capture_lock(self.camera_locked)
 
     def start_jog(self, axis, direction, button):
         # 鼠标移出再移入也可能触发 pressed；必须真正重新按下才能再次运动。
@@ -526,12 +711,41 @@ class MainWindow(QMainWindow):
             button.setDown(False)
 
     def stop_movement(self):
+        if self.scan_active:
+            self.scan_thread.cancel_task()
+            self.scan_status.setText("扫描：正在停止，等待当前动作或写盘收尾")
         self.end_jog()
         self.control_thread.stop_motion()
         self.camera_thread.cancel_capture()
         self.on_text("已请求停止；Z 将走完当前短段后停止")
 
     def eventFilter(self, watched, event):
+        if watched is self.video_label and event.type() == QEvent.Resize and self.current_frame is not None:
+            self.on_frame(self.current_frame)
+        if (watched is self.video_label and self.btn_roi.isChecked()
+                and not self.scan_active and self.current_frame is not None):
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self.roi_start = event.pos()
+                self.roi_band.setGeometry(QRect(self.roi_start, self.roi_start))
+                self.roi_band.show()
+                return True
+            if event.type() == QEvent.MouseMove and self.roi_start is not None:
+                self.roi_band.setGeometry(QRect(self.roi_start, event.pos()).normalized())
+                return True
+            if event.type() == QEvent.MouseButtonRelease and self.roi_start is not None:
+                start = self.roi_start
+                try:
+                    self.roi = roi_from_drag((start.x(), start.y()), (event.x(), event.y()),
+                        (self.video_label.width(), self.video_label.height()),
+                        (self.current_frame.shape[1], self.current_frame.shape[0]),
+                        (self.video_label.pixmap().width(), self.video_label.pixmap().height()))
+                    self.roi_label.setText("ROI：" + ", ".join(map(str, self.roi)) + "（原图像素）")
+                except ValueError as error:
+                    self.roi_label.setText(str(error))
+                self.btn_roi.setChecked(False)
+                self.on_frame(self.current_frame)
+                self.update_scan_plan()
+                return True
         if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
             self.jog_needs_press = False
         if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Space and not event.isAutoRepeat():
@@ -548,13 +762,23 @@ class MainWindow(QMainWindow):
         return super().eventFilter(watched, event)
 
     def on_frame(self, frame):
+        self.current_frame = frame
         rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         image = QImage(rgb.data, w, h, w * ch, QImage.Format_RGB888).copy()
         pixmap = QPixmap.fromImage(image)
-        self.video_label.setPixmap(pixmap.scaled(
+        pixmap = pixmap.scaled(
             self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-        ))
+        )
+        if self.roi is not None:
+            x, y, width, height = self.roi
+            painter = QPainter(pixmap)
+            painter.setPen(QPen(QColor("#f1c54b"), 2))
+            painter.drawRect(round(x * pixmap.width() / w), round(y * pixmap.height() / h),
+                             round(width * pixmap.width() / w), round(height * pixmap.height() / h))
+            painter.end()
+        self.video_label.setPixmap(pixmap)
+        self.btn_roi.setEnabled(not self.scan_active and not self.closing)
 
     def refresh_preview(self):
         frame = self.camera_thread.take_preview_frame()
@@ -567,10 +791,17 @@ class MainWindow(QMainWindow):
             self.closing = True
             self.preview_timer.stop()
             self.stop_movement()
+            self.setEnabled(False)
+        if self.scan_thread.isRunning():
+            self.status_label.setText("正在等待扫描和当前写盘收尾…")
+            event.ignore()
+            QTimer.singleShot(100, self.close)
+            return
+        if not self.workers_stopping:
+            self.workers_stopping = True
             self.send_text("stop")
             self.laplacian_thread.stop_thread()
             self.control_thread.stop_thread()
-            self.setEnabled(False)
         threads = (self.camera_thread, self.laplacian_thread, self.control_thread)
         if any(thread.isRunning() for thread in threads):
             # 不销毁仍在运行的 QThread，也不在 GUI 主线程阻塞等待。

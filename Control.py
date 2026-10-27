@@ -547,6 +547,7 @@ class ControlThread(QThread):
                     self.result_ready.emit(result)
                     self.busy_changed.emit(False)
         finally:
+            self.running = False
             for port in (self.xy_ser, self.z_ser):
                 if port is not None:
                     port.close()

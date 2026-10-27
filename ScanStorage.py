@@ -144,7 +144,16 @@ def commit_sample(run_dir, frame, record):
         raise ValueError("采样点编号、位置或分数无效")
     if record.get("run_id", run["run_id"]) != run["run_id"]:
         raise ValueError("采样点不属于此 Run")
-    if record.get("freshness_method") not in ("continuous_validated", "software_trigger_verified"):
+    method = record.get("freshness_method")
+    if method == "continuous_unverified":
+        if (run.get("capture_policy") != "continuous_auto" or run.get("freshness_method") != method
+                or run.get("freshness_verified") is not False or record.get("freshness_verified") is not False
+                or type(run.get("fresh_guard_ms")) is not int or not 200 <= run["fresh_guard_ms"] <= 60000
+                or run.get("fresh_guard_source") != "exposure_estimate"
+                or record.get("fresh_guard_source") != "exposure_estimate"
+                or record.get("fresh_guard_ms") != run.get("fresh_guard_ms")):
+            raise ValueError("自动连续采集必须保留一致的未验证状态和估算等待")
+    elif method not in ("continuous_validated", "software_trigger_verified"):
         raise ValueError("未验证的新帧只能作为调试数据，不能提交为正式采样点")
     if record.get("acknowledged_steps", target) != target:
         raise ValueError("已确认累计与目标不一致，不能提交采样点")

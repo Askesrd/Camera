@@ -3,6 +3,7 @@
 
 import ctypes
 import copy
+import json
 import math
 import queue
 import threading
@@ -67,6 +68,7 @@ class CameraThread(QThread):
         self.camera_requests = queue.Queue(maxsize=1)
         self.capture_cancel = threading.Event()
         self.freshness_profile = None  # 实机未验证前不宣称正式新帧采集
+        self.capture_policy = "validated"
         self.locked_settings = None
         self.diagnostics = {}
         self.camera_stream_id = None
@@ -168,6 +170,7 @@ class CameraThread(QThread):
             self.camera_owner = owner
             self.capture_cancel.clear()
             self.locked_settings = None
+            self.capture_policy = "validated"
             self.capture_lock_changed.emit(True)
             return True
 
@@ -318,7 +321,7 @@ class CameraThread(QThread):
                 # 拉取相机图像
                 packet = self.read_frame()
                 if packet is None:
-                    self.capture_cancel.wait(0.001)
+                    time.sleep(0.001)
                     continue
                 frame = packet["frame"]
                 with self.exposure_lock:
@@ -404,9 +407,14 @@ class CameraThread(QThread):
         try:
             if request["kind"] == "release":
                 with self.exposure_lock:
+                    if self.capture_cancel.is_set():
+                        self.diagnostics["freshness_method"] = "unverified"
+                        self.diagnostic_ready.emit(copy.deepcopy(self.diagnostics))
                     self.camera_owner = "manual"
                     self.locked_settings = None
                     self.freshness_profile = None
+                    self.capture_policy = "validated"
+                    self.capture_cancel.clear()
                 self.capture_lock_changed.emit(False)
                 result["status"] = "completed"
             elif not self.running or self.capture_cancel.is_set():
@@ -415,11 +423,18 @@ class CameraThread(QThread):
                 if self.locked_settings is not None:
                     raise ValueError("本任务参数已锁定；修改曝光请结束当前任务并新建 Run")
                 config = request["config"]
+                policy = config.get("capture_policy", "validated")
+                if policy not in ("validated", "continuous_auto"):
+                    raise ValueError("不支持的采集策略")
                 exposure, gain = config.get("exposure_us"), config.get("gain_percent")
                 if (type(exposure) is not int or not self.exposure_min <= exposure <= self.exposure_max
                         or self.gain_min is None or type(gain) is not int
                         or not self.gain_min <= gain <= self.gain_max):
                     raise ValueError("曝光或增益超出设备范围，未应用采集参数")
+                if policy == "continuous_auto":
+                    current = self.read_camera_settings()
+                    if not current["ae_enabled"] and exposure == current["real_exposure_us"]:
+                        exposure = current["exposure_us"]  # 重用原命令，避免回读时间反复量化。
                 self.cam.put_AutoExpoEnable(0)
                 if not self.running or self.capture_cancel.is_set():
                     return
@@ -433,8 +448,16 @@ class CameraThread(QThread):
                 if settings["ae_enabled"] or settings["gain_percent"] is None:
                     raise RuntimeError("无法确认固定曝光/增益状态")
                 self.locked_settings = copy.deepcopy(settings)
-                self.freshness_profile = copy.deepcopy(config.get("freshness_profile"))
-                result.update(status="completed", requested=copy.deepcopy(config), readback=settings)
+                self.capture_policy = policy
+                self.freshness_profile = copy.deepcopy(config.get("freshness_profile")) if policy == "validated" else None
+                capture_info = None
+                if config.get("formal", False):
+                    method, guard_ms, timeout = self.check_freshness_profile()
+                    capture_info = {"policy": policy, "freshness_method": method,
+                        "freshness_verified": method == "continuous_validated",
+                        "fresh_guard_ms": guard_ms, "timeout_seconds": timeout}
+                result.update(status="completed", requested=copy.deepcopy(config), readback=settings,
+                              diagnostic=copy.deepcopy(self.diagnostics), capture_info=capture_info)
                 self.show_exposure(force=True)
             elif request["kind"] == "capture":
                 packets, method = self.capture_frames(request["count"], request["debug"])
@@ -444,11 +467,17 @@ class CameraThread(QThread):
                             run_id=request["run_id"], sample_id=request["sample_id"])
                     result.update(status="debug_only" if method == "unverified" else "completed",
                                   frames=packets, freshness_method=method,
+                                  freshness_verified=method == "continuous_validated",
                                   freshness_profile=copy.deepcopy(self.freshness_profile),
                                   settings=copy.deepcopy(self.locked_settings))
         except Exception as error:
-            result.update(status="error", error=str(error))
-            self.text_ready.emit(f"相机采集请求失败：{error}")
+            if request["kind"] == "settings":
+                self.locked_settings = None
+            if isinstance(error, InterruptedError) and self.capture_cancel.is_set():
+                result.update(status="cancelled", error=None)
+            else:
+                result.update(status="error", error=str(error))
+                self.text_ready.emit(f"相机采集请求失败：{error}")
         finally:
             if request["kind"] != "release" and (not self.running or self.capture_cancel.is_set()):
                 result["status"] = "cancelled"
@@ -458,15 +487,14 @@ class CameraThread(QThread):
             result["finished_monotonic_ns"] = time.monotonic_ns()
             self.camera_result.emit(result)
 
-    def capture_frames(self, count=3, debug=False):
-        """连续模式新帧路径。验证窗口来自实机记录，不用标称 FPS 猜测。"""
-        if type(count) is not int or count != 3:
-            raise ValueError("本阶段每个采样请求固定收集三帧")
+    def check_freshness_profile(self, debug=False):
+        """准备等待和截止期限；自动策略是试扫估算，不生成验证结论。"""
         if not self.locked_settings or self.locked_settings["ae_enabled"]:
             raise ValueError("请先应用并锁定手动曝光和增益")
-        profile = self.freshness_profile or {}
-        guard_ms = profile.get("fresh_guard_ms", 0)
-        if (not isinstance(guard_ms, (int, float)) or not math.isfinite(guard_ms)
+        automatic = self.capture_policy == "continuous_auto"
+        profile = {} if automatic else (self.freshness_profile or {})
+        guard_ms = math.ceil(max(200, 2 * self.locked_settings["real_exposure_us"] / 1000)) if automatic else profile.get("fresh_guard_ms", 0)
+        if (type(guard_ms) not in (int, float) or not math.isfinite(guard_ms)
                 or not 0 <= guard_ms <= 60000):
             raise ValueError("新帧等待窗口必须在 0–60000 ms 内")
         verified = profile.get("verified") is True and profile.get("method") == "continuous_validated"
@@ -477,24 +505,20 @@ class CameraThread(QThread):
                 if key not in profile or profile[key] != self.diagnostics.get(key):
                     raise ValueError(f"新帧验证条件已改变或缺失：{key}")
             maximum = profile.get("max_exposure_us")
-            if (not isinstance(maximum, (int, float)) or not math.isfinite(maximum)
+            if (type(maximum) not in (int, float) or not math.isfinite(maximum)
                     or maximum < self.locked_settings["real_exposure_us"]
                     or not profile.get("conditions_note") or not profile.get("verification_note")
                     or guard_ms <= 0):
                 raise ValueError("曝光超出验证范围，或新帧验证记录不完整")
-        elif not debug:
+            if "check_settings" in profile and json.dumps(profile["check_settings"], sort_keys=True) != json.dumps(self.locked_settings, sort_keys=True):
+                raise ValueError("历史验证记录的固定参数与当前曝光、增益或图像处理设置不一致")
+        elif not debug and not automatic:
             raise ValueError("当前相机的新帧时序未经过实机验证，不能作为正式采集成功")
-        method = "continuous_validated" if verified else "unverified"
+        method = "continuous_unverified" if automatic else ("continuous_validated" if verified else "unverified")
         exposure_seconds = self.locked_settings["real_exposure_us"] / 1000000
-        timeout = guard_ms / 1000 + count * (1.02 * exposure_seconds + 4)
+        timeout = guard_ms / 1000 + 3 * (1.02 * exposure_seconds + 4)
         if timeout > 600:
             raise ValueError("三帧采集预计等待超过 600 秒，未开始采集")
-        settings = self.read_camera_settings(processing=True)
-        if settings != self.locked_settings:
-            raise RuntimeError("曝光、增益或图像处理设置已改变")
-        stream_id = self.camera_stream_id
-        with self.exposure_lock:
-            self.preview_frame = None
         # FLUSH 清理缓存，但不保证中断正在曝光的帧；仍须等待已验证窗口。
         try:
             self.cam.put_Option(toupcam.TOUPCAM_OPTION_FLUSH, 3)
@@ -504,6 +528,20 @@ class CameraThread(QThread):
         self.diagnostic_ready.emit(dict(self.diagnostics))
         if verified and profile.get("flush_supported") != self.diagnostics["flush_supported"]:
             raise ValueError("缓存清理能力与新帧验证记录不符")
+        self.diagnostics["freshness_method"] = method
+        self.diagnostic_ready.emit(dict(self.diagnostics))
+        return method, guard_ms, timeout
+
+    def capture_frames(self, count=3, debug=False):
+        """预览始终更新；等待内丢弃的图只显示，不进入三帧采样集合。"""
+        if type(count) is not int or count != 3:
+            raise ValueError("每个采样请求固定收集三帧")
+        if self.read_camera_settings(processing=True) != self.locked_settings:
+            raise RuntimeError("曝光、增益或图像处理设置已改变")
+        method, guard_ms, timeout = self.check_freshness_profile(debug)
+        verified = method == "continuous_validated"
+        self.text_ready.emit(f"采图：等待新帧 {guard_ms:.0f} ms，然后收集三帧")
+        stream_id = self.camera_stream_id
         barrier = time.monotonic()
         fresh_after = barrier + guard_ms / 1000
         deadline = barrier + timeout
@@ -518,6 +556,8 @@ class CameraThread(QThread):
                 self.capture_cancel.wait(0.002)
                 continue
             metadata = packet["metadata"]
+            with self.exposure_lock:
+                self.preview_frame = packet["frame"]
             if metadata["camera_stream_id"] != stream_id:
                 raise RuntimeError("采集帧来自不同的相机流")
             seq, timestamp = metadata["camera_seq"], metadata["camera_timestamp_us"]
@@ -529,19 +569,18 @@ class CameraThread(QThread):
             # 等待窗口内的帧也登记身份，避免之后的重复缓冲被接收。
             if time.monotonic() < fresh_after or duplicate:
                 continue
-            if verified and seq is None and timestamp is None:
+            if method != "unverified" and seq is None and timestamp is None:
                 raise RuntimeError("没有有效设备帧身份，无法确认三张不同的新帧")
             if self.read_camera_settings(processing=True) != self.locked_settings:
                 raise RuntimeError("采集期间曝光、增益或图像处理参数失锁")
             if (metadata["exposure_us"] != self.locked_settings["real_exposure_us"]
                     or metadata["gain_percent"] != self.locked_settings["gain_percent"]):
                 raise RuntimeError("帧的曝光或增益与锁定参数不一致")
-            metadata.update(freshness_method=method, barrier_monotonic_ns=int(barrier * 1000000000))
+            metadata.update(freshness_method=method, freshness_verified=verified,
+                            fresh_guard_ms=guard_ms, barrier_monotonic_ns=int(barrier * 1000000000))
             packets.append(packet)
+            self.text_ready.emit(f"采图：已收到 {len(packets)} / {count} 帧")
             if len(packets) == count:
-                # 预览只保留最后一帧，正式三帧通过一次结果返回。
-                with self.exposure_lock:
-                    self.preview_frame = packets[-1]["frame"]
                 return packets, method
         raise TimeoutError("未在曝光相关期限内收到三张有效新帧")
 
@@ -617,6 +656,8 @@ class CameraThread(QThread):
             gain_request = self.gain_request
             self.gain_request = None
         if request is not None and self.running:
+            self.diagnostics["freshness_method"] = "unverified"
+            self.diagnostic_ready.emit(copy.deepcopy(self.diagnostics))
             request_id, auto, exposure_us = request
             self.exposure_applied_id = request_id
             try:
@@ -631,6 +672,8 @@ class CameraThread(QThread):
             self.show_exposure(force=True)
 
         if gain_request is not None and self.running:
+            self.diagnostics["freshness_method"] = "unverified"
+            self.diagnostic_ready.emit(copy.deepcopy(self.diagnostics))
             request_id, gain = gain_request
             self.gain_applied_id = request_id
             try:
@@ -825,6 +868,7 @@ class CameraThread(QThread):
             self.preview_frame = None
             self.locked_settings = None
             self.freshness_profile = None
+            self.capture_policy = "validated"
             self.camera_owner = "manual"
         self.text_ready.emit("相机线程已退出")
         self.capture_lock_changed.emit(False)
