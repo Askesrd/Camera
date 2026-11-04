@@ -31,8 +31,9 @@ SETTINGS_PATH = Path(__file__).with_name("settings.json")
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, mode, xy_port="", z_port=""):
+    def __init__(self, mode, xy_port="", z_port="", offline=False):
         super().__init__()
+        self.offline = offline
         self.camera_thread = CameraThread(mode)
         self.laplacian_thread = LaplacianThread()
         self.control_thread = ControlThread(xy_port, z_port)
@@ -313,6 +314,7 @@ class MainWindow(QMainWindow):
         scan_grid.addWidget(self.scan_settle, 2, 1)
         self.sample_name = QLineEdit()
         self.sample_name.setPlaceholderText("样品 / 视野名称")
+        self.sample_name.setToolTip("用于扫描记录和原图文件名前缀；留空则使用默认编号")
         scan_grid.addWidget(self.sample_name, 3, 0, 1, 2)
         self.scan_output = QLineEdit(str(SAVE_DIR))
         self.scan_output.setToolTip("扫描数据目录；每条曲线使用唯一 Run，不覆盖旧数据")
@@ -342,6 +344,9 @@ class MainWindow(QMainWindow):
         self.scan_status.setWordWrap(True)
         self.scan_status.setTextFormat(Qt.PlainText)
         scan_grid.addWidget(self.scan_status, 9, 0, 1, 2)
+        self.btn_history = QPushButton("加载历史扫描…")
+        self.btn_history.clicked.connect(self.open_history)
+        scan_grid.addWidget(self.btn_history, 10, 0, 1, 2)
         self.scan_inputs = [self.scan_a, self.scan_b, self.scan_interval, self.scan_settle,
             self.sample_name, self.scan_output, self.btn_scan_output, self.btn_roi,
             self.btn_full_roi]
@@ -395,6 +400,7 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout()
         right_layout.addWidget(status_group)
         self.scan_panel = ScanPanel()
+        self.scan_panel.btn_expand.toggled.connect(self.video_label.setHidden)
         self.scan_panel.hide()
         self.image_splitter = QSplitter(Qt.Vertical)
         self.image_splitter.addWidget(self.video_label)
@@ -438,9 +444,22 @@ class MainWindow(QMainWindow):
 
         QApplication.instance().installEventFilter(self)
         self.update_controls(True)
-        self.camera_thread.start()
-        self.laplacian_thread.start()
-        self.control_thread.start()
+        if offline:
+            self.control_busy = False
+            self.status_label.setText("控制：离线浏览")
+            self.camera_status_label.setText("相机：离线浏览")
+            self.info_label.setText("历史数据仅供查看；当前未连接设备")
+            self.control_label.setText("XY / Z：未连接")
+            self.video_label.setText("离线浏览 · 实时相机未启动")
+            self.video_label.hide()
+            self.scan_panel.btn_expand.hide()
+            for button in (self.btn_save, self.btn_record_start, self.btn_record_stop, self.btn_auto):
+                button.setEnabled(False)
+            self.scan_panel.show()
+        else:
+            self.camera_thread.start()
+            self.laplacian_thread.start()
+            self.control_thread.start()
 
     def send_text(self, text):
         self.camera_thread.send_text(text)
@@ -618,8 +637,17 @@ class MainWindow(QMainWindow):
         if path:
             self.scan_output.setText(path)
 
+    def open_history(self):
+        if not self.closing and self.scan_panel.choose_history(str(SAVE_DIR)):
+            self.scan_panel.show()
+            self.image_splitter.setSizes([260, 400])
+            if self.height() < 740:
+                self.scan_panel.btn_expand.setChecked(True)
+
     def on_roi_mode(self, checked):
-        if not checked:
+        if checked:
+            self.scan_panel.btn_expand.setChecked(False)
+        else:
             self.roi_start = None
             self.roi_band.hide()
 
@@ -670,10 +698,14 @@ class MainWindow(QMainWindow):
 
     def on_scan_prepared(self, payload):
         self.scan_panel.begin_run(payload)
-        self.scan_panel.show()
-        self.image_splitter.setSizes([420, 270])
+        if self.scan_panel.isHidden():
+            self.scan_panel.show()
+            self.image_splitter.setSizes([280, 380])
+            if self.height() < 740:
+                self.scan_panel.btn_expand.setChecked(True)
 
     def on_scan_result(self, result):
+        self.scan_panel.finish_run(result)
         name = {"completed": "完成", "cancelled": "已取消", "failed": "失败"}[result["status"]]
         self.scan_status.setText(f"扫描{name}，已保存 {result['committed_count']} 点\n"
             + (result.get("cleanup_error") or result.get("error") or "结束后停留在终点，未自动回位"))
@@ -791,6 +823,7 @@ class MainWindow(QMainWindow):
             self.closing = True
             self.preview_timer.stop()
             self.stop_movement()
+            self.scan_panel.shutdown()
             self.setEnabled(False)
         if self.scan_thread.isRunning():
             self.status_label.setText("正在等待扫描和当前写盘收尾…")
@@ -802,7 +835,7 @@ class MainWindow(QMainWindow):
             self.send_text("stop")
             self.laplacian_thread.stop_thread()
             self.control_thread.stop_thread()
-        threads = (self.camera_thread, self.laplacian_thread, self.control_thread)
+        threads = (self.camera_thread, self.laplacian_thread, self.control_thread, self.scan_panel.file_thread)
         if any(thread.isRunning() for thread in threads):
             # 不销毁仍在运行的 QThread，也不在 GUI 主线程阻塞等待。
             self.status_label.setText("正在停止运动并关闭设备…")
@@ -856,6 +889,10 @@ def choose_settings():
     form.addRow("XY · ASI 串口", xy_box)
     form.addRow("Z · Arduino 串口", z_box)
     layout.addLayout(form)
+    offline_box = QCheckBox("离线浏览（不连接相机与串口）")
+    offline_box.setObjectName("offlineBrowse")
+    offline_box.toggled.connect(lambda checked: [box.setEnabled(not checked) for box in (mode_box, xy_box, z_box)])
+    layout.addWidget(offline_box)
     buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
     buttons.button(QDialogButtonBox.Ok).setText("启动")
     buttons.button(QDialogButtonBox.Cancel).setText("取消")
@@ -863,6 +900,9 @@ def choose_settings():
     buttons.rejected.connect(dialog.reject)
     layout.addWidget(buttons)
     while dialog.exec_() == QDialog.Accepted:
+        if offline_box.isChecked():
+            # 离线进入不改写已经记住的串口，也不把它们传给设备。
+            return mode_box.currentIndex(), "", "", True
         xy_port = xy_box.currentText().strip().upper()
         z_port = z_box.currentText().strip().upper()
         if xy_port and xy_port == z_port:
@@ -875,7 +915,7 @@ def choose_settings():
             )
         except OSError as e:
             QMessageBox.warning(dialog, "设置未保存", f"本次仍可启动，但无法记住串口号：{e}")
-        return mode_box.currentIndex(), xy_port, z_port
+        return mode_box.currentIndex(), xy_port, z_port, False
     return None
 
 
