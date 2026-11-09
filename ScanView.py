@@ -287,6 +287,7 @@ class FocusCurve(QWidget):
 
 
 class ScanPanel(QWidget):
+    selection_changed = pyqtSignal()
     PAGE_SIZE = 48
     THUMB_CACHE_SIZE = 128
 
@@ -402,6 +403,18 @@ class ScanPanel(QWidget):
         self.file_status.setTextFormat(Qt.PlainText)
         self.file_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         layout.addWidget(self.description)
+        actions = QHBoxLayout()
+        self.btn_revisit = QPushButton("返回此位置")
+        self.btn_fine_scan = QPushButton("选区新建扫描")
+        for button in (self.btn_revisit, self.btn_fine_scan):
+            button.setEnabled(False)
+            button.setFixedWidth(115)
+            actions.addWidget(button)
+        self.action_hint = QLabel("请选择采样点或区间")
+        self.action_hint.setTextFormat(Qt.PlainText)
+        self.action_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        actions.addWidget(self.action_hint, stretch=1)
+        layout.addLayout(actions)
         layout.addWidget(self.file_status)
         self.thumbnails.currentItemChanged.connect(self.on_item)
         self.update_selection()
@@ -576,6 +589,7 @@ class ScanPanel(QWidget):
             scope = "整条" if self.selected_interval is None else f"区间 {self.selected_interval[0]:g}…{self.selected_interval[1]:g} 脉冲"
             self.title.setText(f"当前 {self.active_run_id} · {scope} · {len(records)} 点 · 异常图 {bad}")
             self.title.setToolTip(self.title.text() + "\n" + entry["run_dir"] + "\n" + "\n".join(entry["issues"]))
+        self.selection_changed.emit()
 
     def cache_thumbnail(self, run_id, sample_id, frame):
         rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
@@ -699,6 +713,7 @@ class ScanPanel(QWidget):
                 "run": run, "run_dir": entry["run_dir"], "record": record})
         else:
             self.history_image.setText("未记录原图路径")
+        self.selection_changed.emit()
 
     def choose_history(self, initial=""):
         directory = QFileDialog.getExistingDirectory(self, "选择 Session、Run 或扫描数据目录", initial)

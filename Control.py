@@ -27,6 +27,35 @@ JOG_MAX_XY_MM = 5.0     # XY 长按一次只发一条 R，各参与轴最多走 
 JOG_MAX_Z_STEPS = 2000
 JOG_HEARTBEAT_TIMEOUT = 0.4  # GUI 卡住时，XY 发 HALT，Z 不再发送下一段
 
+Z_REFERENCE_FIELDS = ("connection_id", "z_reference_id", "view_context_id",
+                      "pulses_per_rev", "lead_mm", "gear_ratio", "full_steps_per_rev")
+
+
+def check_z_target(position, target=None, reference=None):
+    """只检查快照，不操作设备；历史定位还必须属于同一次参考和视野。"""
+    if not position.get("z_position_valid") or not position.get("z_reference_confirmed"):
+        raise ValueError("Z 参考无效或尚未确认，不能自动定位")
+    if reference is not None:
+        for key in Z_REFERENCE_FIELDS:
+            value = reference.get(key)
+            if ((key in Z_REFERENCE_FIELDS[:3] and (not isinstance(value, str) or not value))
+                    or (key in Z_REFERENCE_FIELDS[3:] and (type(value) not in (int, float) or not math.isfinite(value) or value <= 0))
+                    or value != position.get(key)):
+                raise ValueError("连接、Z 参考、视野或脉冲比例已改变，历史数据只能查看")
+    if target is None:
+        return
+    if type(target) is not int or type(position.get("z_command_steps")) is not int:
+        raise ValueError("Z 位置必须是整数脉冲")
+    allowed = position.get("allowed_z_range")
+    if allowed is None:
+        raise ValueError("请先手动记录 A/B，建立允许自动移动的范围")
+    low, high = allowed
+    if not low <= position["z_command_steps"] <= high or not low <= target <= high:
+        raise ValueError("当前位置或目标超出已确认的 A/B 范围")
+    if abs(target - position["z_command_steps"]) > MAX_Z_MOVE_STEPS:
+        raise ValueError("Z 定位跨度超过 10000 脉冲，未发送运动")
+
+
 class ControlThread(QThread):
     text_ready = pyqtSignal(str)
     info_ready = pyqtSignal(str)
@@ -64,7 +93,7 @@ class ControlThread(QThread):
         self.jog_alive = 0.0
         self.jog_started = 0.0
 
-    def send_command(self, command, axis="", value=0, owner="manual", request_id=None):
+    def send_command(self, command, axis="", value=0, owner="manual", request_id=None, reference=None):
         """GUI 只放入一条任务；运动期间不积压点击，也不在这里读写串口。"""
         with self.command_lock:
             if not self.running or self.busy:
@@ -94,7 +123,7 @@ class ControlThread(QThread):
                 if command == "jog" and value not in (-1, 1):
                     return False
             elif command == "z_to":
-                if axis != "Z" or type(value) is not int:
+                if axis != "Z" or type(value) is not int or (reference is not None and not isinstance(reference, dict)):
                     return False
             elif command in ("reference", "mark"):
                 if (axis != "Z" or (command == "mark" and value not in ("A", "B"))
@@ -112,6 +141,8 @@ class ControlThread(QThread):
             self.jog_alive = time.monotonic()
             self.busy = True
             self.request_context = {"request_id": request_id or uuid.uuid4().hex, "owner": owner}
+            if command == "z_to" and reference is not None:
+                self.request_context["reference"] = {key: reference.get(key) for key in Z_REFERENCE_FIELDS}
             self.commands.put_nowait((command, axis, value))
         self.busy_changed.emit(True)
         return True
@@ -134,8 +165,8 @@ class ControlThread(QThread):
             self.position_ready.emit(self.position_snapshot())
             return True
 
-    def request_z_move(self, target_steps, request_id, owner):
-        return self.send_command("z_to", "Z", target_steps, owner, request_id)
+    def request_z_move(self, target_steps, request_id, owner, reference=None):
+        return self.send_command("z_to", "Z", target_steps, owner, request_id, reference)
 
     def request_position(self, request_id):
         return self.send_command("snapshot", request_id=request_id)
@@ -358,20 +389,12 @@ class ControlThread(QThread):
             raise ValueError("预计 XY 移动超过 600 秒，请减小距离或提高速度；未发送运动")
         return timeout
 
-    def move_z_to(self, target_steps):
+    def move_z_to(self, target_steps, reference=None):
         """Python 指令绝对定位；UNO 仍只接收方向和相对脉冲数。"""
         if type(target_steps) is not int:
             raise ValueError("Z 目标必须是整数脉冲")
-        if not self.z_position_known or not self.z_reference_confirmed:
-            raise ValueError("Z 参考无效或尚未确认，不能自动定位")
-        if self.allowed_z_range is None:
-            raise ValueError("请先手动记录 A/B，建立允许自动移动的范围")
-        low, high = self.allowed_z_range
-        if not low <= self.z_steps <= high or not low <= target_steps <= high:
-            raise ValueError("当前位置或目标超出已确认的 A/B 范围")
+        check_z_target(self.position_snapshot(), target_steps, reference)
         delta = target_steps - self.z_steps
-        if abs(delta) > MAX_Z_MOVE_STEPS:
-            raise ValueError("Z 定位跨度超过 10000 脉冲，未发送运动")
         if self.should_stop():
             return False
         if delta == 0:
@@ -474,7 +497,7 @@ class ControlThread(QThread):
                             self.allowed_z_range = (min(marks.values()), max(marks.values()))
                         self.text_ready.emit(f"已记录 {value}：{self.z_steps:+d} 脉冲")
                     elif command == "z_to":
-                        completed = self.move_z_to(value)
+                        completed = self.move_z_to(value, context.get("reference"))
                         result["status"] = "completed" if completed else "cancelled"
                         self.text_ready.emit("Z 目标指令已完成" if completed else "Z 定位已取消")
                     elif command == "speed":

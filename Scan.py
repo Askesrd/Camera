@@ -14,12 +14,65 @@ import cv2 as cv
 import numpy as np
 from PyQt5.QtCore import QThread, Qt, pyqtSignal
 
-from Control import MAX_Z_MOVE_STEPS, Z_CHUNK_STEPS
+from Control import MAX_Z_MOVE_STEPS, Z_CHUNK_STEPS, Z_REFERENCE_FIELDS, check_z_target
 from Laplacian import tenengrad
 from ScanStorage import create_session, create_run, write_json, write_image, commit_sample, read_run
 
 
 MAX_SCAN_POINTS = 2000
+
+
+def point_target(run, record):
+    """只接受当前 Run 内已提交的真实点，不使用曲线插值或理论微米数。"""
+    target = record.get("target_steps")
+    if (not isinstance(run.get("run_id"), str) or not run["run_id"]
+            or record.get("run_id") != run["run_id"] or type(record.get("sample_id")) is not int
+            or record["sample_id"] < 0 or record.get("capture_status") != "committed"
+            or type(target) is not int or type(record.get("acknowledged_steps")) is not int or record["acknowledged_steps"] != target
+            or record.get("z_reference_id", run.get("z_reference_id")) != run.get("z_reference_id")):
+        raise ValueError("所选记录缺少有效的已提交整数位置")
+    return target
+
+
+def make_fine_source(run, records, interval):
+    if interval is None or len(interval) != 2 or any(type(v) not in (int, float) or not math.isfinite(v) for v in interval):
+        raise ValueError("请先在当前曲线上选择精扫区间")
+    low, high = sorted(interval)
+    chosen = [r for r in records if low <= r["target_steps"] <= high]
+    targets = [point_target(run, record) for record in chosen]
+    direction = run.get("scan_direction")
+    if direction not in (-1, 1):
+        a, b = run.get("a_steps"), run.get("b_steps")
+        direction = (1 if b > a else -1) if type(a) is int and type(b) is int and a != b else 0
+    if (len(targets) < 2 or direction not in (-1, 1)
+            or any(direction * (b - a) <= 0 for a, b in zip(targets, targets[1:]))):
+        raise ValueError("精扫区间至少包含两个按原采集方向排列的不同位置")
+    return {"run_id": run["run_id"], "session_id": run.get("session_id"), "interval": [low, high],
+            "sample_ids": [r["sample_id"] for r in chosen], "targets": targets, "direction": direction,
+            "context": {key: run.get(key) for key in Z_REFERENCE_FIELDS}}
+
+
+def check_fine_scan(config, position):
+    source = config.get("parent_selection")
+    if source is None:
+        if config.get("parent_run_id") is not None:
+            raise ValueError("精扫来源记录不完整")
+        return
+    if (not isinstance(source, dict) or not source.get("run_id") or config.get("parent_run_id") != source["run_id"]
+            or not isinstance(source.get("context"), dict)):
+        raise ValueError("精扫来源身份无效")
+    targets, ids, direction = source.get("targets", []), source.get("sample_ids", []), source.get("direction")
+    if (len(targets) < 2 or len(targets) != len(ids) or len(set(ids)) != len(ids)
+            or any(type(v) is not int for v in targets + ids) or direction not in (-1, 1)
+            or any(direction * (b - a) <= 0 for a, b in zip(targets, targets[1:]))):
+        raise ValueError("精扫来源的采样点无效")
+    a, b = config["a_steps"], config["b_steps"]
+    if (type(a) is not int or type(b) is not int or direction * (b - a) <= 0
+            or not min(targets) <= a <= max(targets) or not min(targets) <= b <= max(targets)):
+        raise ValueError("精扫 A/B 须位于来源选区内并保持原方向；独立扫描请先清除来源")
+    check_z_target(position, a, source["context"])
+    if not position["allowed_z_range"][0] <= b <= position["allowed_z_range"][1]:
+        raise ValueError("精扫终点超出当前允许范围")
 
 
 def make_scan_plan(a, b, interval, width, height, roi=None):
@@ -56,6 +109,7 @@ class ScanThread(QThread):
         super().__init__()
         self.control, self.camera = control, camera
         self.config = None
+        self.task_kind = "scan"
         self.owner = None
         self.cancelled = threading.Event()
         self.result_lock = threading.RLock()
@@ -71,10 +125,11 @@ class ScanThread(QThread):
         control.result_ready.connect(self.on_control_result, Qt.DirectConnection)
         camera.camera_result.connect(self.on_camera_result, Qt.DirectConnection)
 
-    def configure(self, config):
-        if self.isRunning() or self.control_owned or self.camera_owned:
+    def configure(self, config, kind="scan"):
+        if kind not in ("scan", "revisit") or self.isRunning() or self.control_owned or self.camera_owned:
             return False
         self.config = copy.deepcopy(config)
+        self.task_kind = kind
         self.owner = None
         self.run_dir = None
         self.emitted_ids.clear()
@@ -109,7 +164,7 @@ class ScanThread(QThread):
 
     def request(self, source, submit, timeout, cleanup=False):
         if self.cancelled.is_set() and not cleanup:
-            raise InterruptedError("扫描已取消")
+            raise InterruptedError("任务已取消")
         request_id = uuid.uuid4().hex
         with self.result_lock:
             self.expected = (source, request_id)
@@ -129,7 +184,7 @@ class ScanThread(QThread):
                         raise RuntimeError("控制器或相机线程已退出")
                     continue
                 if not cleanup and (self.cancelled.is_set() or result["status"] == "cancelled"):
-                    raise InterruptedError("扫描已取消")
+                    raise InterruptedError("任务已取消")
                 if result["status"] != "completed":
                     raise RuntimeError(result.get("error") or "设备没有返回有效完成结果")
                 return result
@@ -158,12 +213,18 @@ class ScanThread(QThread):
         self.emitted_ids.add(record["sample_id"])
 
     def run(self):
+        if self.task_kind == "revisit":
+            self.run_revisit()
+            return
         status, error, cleanup_error, committed = "failed", None, None, 0
         run = None
         try:
             self.change_state("PREPARING")
             config = copy.deepcopy(self.config)
             position = config["position"]
+            check_fine_scan(config, position)
+            if config.get("approach_steps", 0) != 0:
+                raise ValueError("同向接近尚未启用，请使用 0 脉冲")
             plan = make_scan_plan(config["a_steps"], config["b_steps"], config["interval_steps"],
                                   config["width"], config["height"], config.get("roi"))
             settle_ms = config.get("settle_ms", 200)
@@ -195,6 +256,7 @@ class ScanThread(QThread):
                 raise RuntimeError("运动设备忙，无法取得扫描控制权")
             self.control_owned = True
             snapshot = self.request("control", self.control.request_position, 2)["position"]
+            check_fine_scan(config, snapshot)
             if (not snapshot["z_position_valid"] or not snapshot["z_reference_confirmed"]
                     or any(snapshot[key] != position[key] for key in ("connection_id", "z_reference_id", "view_context_id",
                         "pulses_per_rev", "lead_mm", "gear_ratio", "full_steps_per_rev"))):
@@ -252,7 +314,10 @@ class ScanThread(QThread):
                 self.change_state("MOVING")
                 distance = abs(target - current)
                 motion_timeout = 4 + distance / 1000 + math.ceil(distance / Z_CHUNK_STEPS)
-                moved = self.request("control", lambda req: self.control.request_z_move(target, req, self.owner), motion_timeout)
+                if config.get("parent_selection"):
+                    moved = self.request("control", lambda req: self.control.request_z_move(target, req, self.owner, position), motion_timeout)
+                else:
+                    moved = self.request("control", lambda req: self.control.request_z_move(target, req, self.owner), motion_timeout)
                 point_position = moved["position"]
                 if (not point_position["z_position_valid"] or point_position["z_command_steps"] != target
                         or point_position["z_reference_id"] != position["z_reference_id"]):
@@ -382,3 +447,64 @@ class ScanThread(QThread):
             self.task_result.emit({"run_id": self.owner, "status": status, "error": error,
                 "cleanup_error": cleanup_error, "committed_count": committed,
                 "run_dir": str(self.run_dir) if self.run_dir else None})
+
+    def run_revisit(self):
+        """复用扫描线程调度一次回位；不取三帧、不写历史文件。"""
+        status, error, cleanup_error = "failed", None, None
+        config = copy.deepcopy(self.config)
+        target = None
+        self.owner = "revisit_" + uuid.uuid4().hex
+        try:
+            self.change_state("PREPARING")
+            source, record = config["source_run"], config["record"]
+            target = point_target(source, record)
+            settle_ms = config.get("settle_ms", 200)
+            if type(settle_ms) is not int or not 0 <= settle_ms <= 60000:
+                raise ValueError("停稳等待须为 0–60000 ms")
+            if config.get("approach_steps", 0) != 0:
+                raise ValueError("同向接近尚未启用，请使用直接回位")
+            check_z_target(config["position"], target, source)
+            if not self.control.acquire_control(self.owner):
+                raise RuntimeError("运动设备忙，无法取得回位控制权")
+            self.control_owned = True
+            position = self.request("control", self.control.request_position, 2)["position"]
+            check_z_target(position, target, source)
+            check_z_target(position, target, config["position"])
+            self.change_state("MOVING")
+            distance = abs(target - position["z_command_steps"])
+            timeout = 4 + distance / 1000 + math.ceil(distance / Z_CHUNK_STEPS)
+            moved = self.request("control", lambda req: self.control.request_z_move(target, req, self.owner, source), timeout)
+            check_z_target(moved["position"], target, source)
+            if (moved.get("command") != "z_to" or moved.get("target_steps") != target
+                    or moved["position"]["z_command_steps"] != target):
+                raise RuntimeError("回位完成结果的位置不匹配")
+            self.change_state("SETTLING")
+            if self.cancelled.wait(settle_ms / 1000):
+                raise InterruptedError("回位停稳等待期间取消")
+            position = self.control.position_snapshot()
+            check_z_target(position, target, source)
+            if position["z_command_steps"] != target:
+                raise RuntimeError("回位停稳期间位置发生变化")
+            status = "completed"
+        except InterruptedError as exception:
+            status, error = "cancelled", str(exception)
+        except Exception as exception:
+            status, error = "failed", str(exception)
+        finally:
+            self.cancel_task()
+            deadline = time.monotonic() + max(5, self.pending_timeout + 2)
+            while self.control_owned and self.control.busy and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if self.control_owned:
+                try:
+                    if not self.control.release_control(self.owner):
+                        raise RuntimeError("运动尚未结束，回位控制权保持锁定")
+                    self.control_owned = False
+                except Exception as exception:
+                    status, cleanup_error = "failed", str(exception)
+            self.state_changed.emit(status.upper())
+            self.task_result.emit({"kind": "revisit", "run_id": self.owner, "status": status,
+                "source_run_id": config.get("source_run", {}).get("run_id"),
+                "sample_id": config.get("record", {}).get("sample_id"), "target_steps": target,
+                "position": self.control.position_snapshot(), "approach_steps": 0,
+                "error": error, "cleanup_error": cleanup_error, "committed_count": 0, "run_dir": None})
